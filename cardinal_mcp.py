@@ -68,12 +68,27 @@ async def get_module_params(module_id: int) -> list[dict]:
     return await c.module_params(module_id)
 
 
+def _module_matches(module: dict, query: str) -> bool:
+    for key in ("name", "plugin", "model", "description", "slug"):
+        val = module.get(key, "")
+        if val and query in str(val).lower():
+            return True
+    tags = module.get("tags")
+    if isinstance(tags, list):
+        for tag in tags:
+            if query in str(tag).lower():
+                return True
+    elif isinstance(tags, str) and query in tags.lower():
+        return True
+    return False
+
+
 @mcp.tool()
 async def search_for_available_module(query: str) -> list[dict]:
-    """Search for available modules by name. Case-insensitive substring match."""
+    """Search for available modules by name, plugin, model, description, slug, or tags. Case-insensitive substring match."""
     c = await get_osc_client()
     query_lower = query.lower()
-    return [m for m in c.available_modules if query_lower in repr(m).lower()]
+    return [m for m in c.available_modules if _module_matches(m, query_lower)]
 
 
 @mcp.tool()
@@ -99,6 +114,29 @@ async def add_cable(source_module_id: int, source_output_id: int, target_module_
 
 
 @mcp.tool()
+async def add_cables(cables: list[dict]) -> list[dict]:
+    """Add multiple cables in one call.
+
+    Each entry should be a dict with keys: source_module_id, source_output_id, target_module_id, target_input_id (all ints).
+    Returns a list of results, each with cable_id on success or error on failure. Continues after failures.
+    """
+    c = await get_osc_client()
+    results = []
+    for i, cab in enumerate(cables):
+        try:
+            cable_id = await c.cable_add(
+                int(cab["source_module_id"]),
+                int(cab["source_output_id"]),
+                int(cab["target_module_id"]),
+                int(cab["target_input_id"]),
+            )
+            results.append({"index": i, "cable_id": cable_id})
+        except Exception as e:
+            results.append({"index": i, "error": str(e)})
+    return results
+
+
+@mcp.tool()
 async def remove_cable(cable_id: int) -> None:
     """Remove a cable by its ID."""
     c = await get_osc_client()
@@ -120,10 +158,79 @@ async def set_param(module_id: int, param_id: int, value: float) -> None:
 
 
 @mcp.tool()
+async def set_params(params: list[dict]) -> int:
+    """Set multiple parameter values in one call.
+
+    Each entry in params should be a dict with keys: module_id (int), param_id (int), value (float).
+    Returns the number of parameters set.
+    """
+    c = await get_osc_client()
+    count = 0
+    for p in params:
+        c.set_param(int(p["module_id"]), int(p["param_id"]), float(p["value"]))
+        count += 1
+    return count
+
+
+@mcp.tool()
 async def set_host_param(param_id: int, value: float) -> None:
-    """Set a host parameter value."""
+    """Set a host parameter value.
+
+    Known host parameter IDs:
+    - 0: Reset (1.0 to trigger)
+    - 1: BPM (e.g. 120.0)
+    - 2: Play (1.0 = play, 0.0 = stop)
+    """
     c = await get_osc_client()
     c.set_host_param(param_id, value)
+
+
+@mcp.tool()
+async def get_module_full_info(module_id: int) -> dict:
+    """Get complete info about a module in one call: info, params, inputs, and outputs."""
+    c = await get_osc_client()
+    info = await c.module_info(module_id)
+    params = await c.module_params(module_id)
+    inputs = await c.module_inputs(module_id)
+    outputs = await c.module_outputs(module_id)
+    return {"info": info, "params": params, "inputs": inputs, "outputs": outputs}
+
+
+@mcp.tool()
+async def get_patch_state(
+    module_ids: list[int] | None = None,
+    include_params: bool = True,
+    include_inputs: bool = True,
+    include_outputs: bool = True,
+) -> dict:
+    """Get the full state of the current patch in one call.
+
+    Returns modules, cables, and detailed info (params, inputs, outputs) for every module.
+    This replaces the need for separate get_modules + get_cables + N * get_module_params/inputs/outputs calls.
+
+    For large patches, use the filtering options to reduce response size:
+    - module_ids: Only include details for these specific module IDs (cables and module list are always complete).
+    - include_params/include_inputs/include_outputs: Set to false to omit that section from module details.
+    """
+    c = await get_osc_client()
+    modules = await c.refresh_modules()
+    cables = await c.cables_list()
+    module_details = {}
+    for mod in modules:
+        mid = mod.get("id")
+        if mid is None:
+            continue
+        if module_ids is not None and mid not in module_ids:
+            continue
+        detail: dict = {}
+        if include_params:
+            detail["params"] = await c.module_params(mid)
+        if include_inputs:
+            detail["inputs"] = await c.module_inputs(mid)
+        if include_outputs:
+            detail["outputs"] = await c.module_outputs(mid)
+        module_details[str(mid)] = detail
+    return {"modules": modules, "cables": cables, "module_details": module_details}
 
 
 @mcp.tool()
